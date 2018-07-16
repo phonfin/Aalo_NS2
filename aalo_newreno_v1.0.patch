@@ -1,0 +1,1138 @@
+diff -ruN temp/ns-allinone-2.35/ns-2.35/apps/app.cc ns-allinone-2.35/ns-2.35/apps/app.cc
+--- temp/ns-allinone-2.35/ns-2.35/apps/app.cc	1999-03-04 10:21:34.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/apps/app.cc	2018-06-01 08:03:03.287835500 +0800
+@@ -95,6 +95,9 @@
+ 	return (Process::command(argc, argv));
+ }
+ 
++void Application::agentCallBack(int idx){
++
++}
+ 
+ void Application::start()
+ {
+diff -ruN temp/ns-allinone-2.35/ns-2.35/apps/app.h ns-allinone-2.35/ns-2.35/apps/app.h
+--- temp/ns-allinone-2.35/ns-2.35/apps/app.h	1999-09-28 11:46:27.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/apps/app.h	2018-06-01 08:03:03.287835500 +0800
+@@ -51,6 +51,7 @@
+ 	virtual void send(int nbytes);
+ 	virtual void recv(int nbytes);
+ 	virtual void resume();
++	virtual void agentCallBack(int idx);
+ 
+ protected:
+ 	virtual int command(int argc, const char*const* argv);
+diff -ruN temp/ns-allinone-2.35/ns-2.35/apps/task.cc ns-allinone-2.35/ns-2.35/apps/task.cc
+--- temp/ns-allinone-2.35/ns-2.35/apps/task.cc	1970-01-01 08:00:00.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/apps/task.cc	2018-06-05 05:47:34.587612733 +0800
+@@ -0,0 +1,471 @@
++/* -*-	Mode:C++; c-basic-offset:8; tab-width:8; indent-tabs-mode:t -*- */
++/*
++ * Copyright (c) 1997 Regents of the University of California.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. All advertising materials mentioning features or use of this software
++ *    must display the following acknowledgement:
++ *	This product includes software developed by the Daedalus Research
++ *	Group at the University of California Berkeley.
++ * 4. Neither the name of the University nor of the Laboratory may be used
++ *    to endorse or promote products derived from this software without
++ *    specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * Contributed by the Daedalus Research Group, http://daedalus.cs.berkeley.edu
++ *
++ */
++
++#include "task.h"
++#include "agent.h"
++
++bool SortFlow( flowinfo* v1, flowinfo* v2)
++{  
++    return v1->sid_ > v2->sid_;	//decreasing order 
++}  
++
++
++static class TaskClass : public TclClass {
++ public:
++	TaskClass() : TclClass("Application/Task") {}
++	TclObject* create(int, const char*const*) {
++		return (new Task);
++	}
++} class_task;
++
++
++Task::Task()
++{
++	this->agents_ = new vector<Agent*>();
++	this->fis_ = new vector<flowinfo*>();
++	
++	this->current_max_ = 0;
++	this->printable_ = false;
++}
++
++
++int Task::command(int argc, const char*const* argv)
++{
++	Tcl& tcl = Tcl::instance();
++	if (argc == 2) {
++		if (strcmp(argv[1], "start") == 0) {
++			// enableRecv_ only if recv() exists in Tcl
++			tcl.evalf("[%s info class] info instprocs", name_);
++			char result[1024];
++			sprintf(result, " %s ", tcl.result());
++			enableRecv_ = (strstr(result, " recv ") != 0);
++			enableResume_ = (strstr(result, " resume ") != 0);
++			start();
++			return (TCL_OK);
++		}
++
++		if (strcmp(argv[1], "stop") == 0) {
++			stop();
++			return (TCL_OK);
++		}
++		if (strcmp(argv[1], "agent") == 0) {
++			tcl.resultf("%s", agent_->name());
++			return (TCL_OK);
++		}
++		if (strcmp(argv[1], "pre-send") == 0) {
++			this->pre_send();
++			return (TCL_OK);
++		}
++		if (strcmp(argv[1], "reset-max-stage")==0) {
++
++			this->current_max_ = 0;
++			return (TCL_OK);
++		}
++		
++	}
++	else if (argc == 3) {
++		if (strcmp(argv[1], "attach-agent") == 0) {
++			
++			Agent* agent_ = (Agent*) TclObject::lookup(argv[2]);
++			if (agent_ == 0) {
++				tcl.resultf("no such agent %s", argv[2]);
++				return(TCL_ERROR);
++			}
++			// used for callback of application
++			agent_->attachApp(this);
++			agents_->push_back(agent_);
++			
++			return(TCL_OK);
++		}
++		if (strcmp(argv[1], "send") == 0) {
++			send(atoi(argv[2]));
++			return(TCL_OK);
++		}
++		if (strcmp(argv[1], "send-flow") == 0) {
++			int fid = atoi(argv[2]);
++			this->send_certain_flow(fid);
++			return (TCL_OK);
++		}
++		if (strcmp(argv[1], "printable") == 0) {
++
++			int flag = atoi(argv[2]);
++
++			if(flag){
++				this->printable_ = true;
++			}else{
++				this->printable_ = false;
++			}
++			//printf("printable:%d\n", this->printable_);
++			return (TCL_OK);
++		}
++		
++	}
++	else if (argc ==4) {
++		
++		// for details of tasks or stages
++		if (strcmp(argv[1], "stage-index") == 0){
++			/*
++			* e.g. $task stage-index fid_ StageID
++			* CATION:
++			* a "task" application start send data from greater StageID
++			*/
++			int fid = atoi(argv[2]);
++			int sid = atoi(argv[3]);
++			int fis_size = (this->fis_)->size();
++			bool isFound = false;
++
++			for(int i=0; i<fis_size; i++){
++
++				flowinfo* fi = (this->fis_)->at(i);
++				if(fi->fid_ == fid){
++
++					fi->sid_ = sid;
++					isFound = true;
++					//printf("change fid no.%d to stage %d\n", fid, sid);
++					//record the max stageID among flows
++					if(sid > current_max_){
++						current_max_ = sid;
++					}
++					break;
++				}
++			}
++			if(!isFound){
++				return(TCL_ERROR);
++			}else{
++				return(TCL_OK);
++			}
++		}
++
++	}else if( argc==6 || argc==7 ){
++
++		if(strcmp(argv[1], "attach-agent") == 0){
++			/*
++			 * attach-agent agent agent_id stage_id size_of_flow
++			 * e.g. task attach-agent tcp(0) [tcp(0) set fid_] sid_(0) size_(0)
++			 */
++			Agent* agent_ = (Agent*) TclObject::lookup(argv[2]);
++			if (agent_ == 0) {
++				tcl.resultf("no such agent %s", argv[2]);
++				return(TCL_ERROR);
++			}
++			agent_->attachApp(this);
++			int fid = atoi(argv[3]);
++			int sid = atoi(argv[4]);
++			long size = atol(argv[5]);
++			double st = -1;
++			if(argc==7){
++				st = atof(argv[6]);
++			}
++
++			//printf("flow %d in attach_agent WITH startting time\n", fid);
++			int fis_size = (this->fis_)->size();
++			bool isFound = false;
++			for(int i=0; i<fis_size; i++){
++		
++				flowinfo* fi = (this->fis_)->at(i);
++				if(fi->fid_ == fid){
++			
++					fi->sid_ = sid;
++					fi->size_ = size;
++					fi->st_ = st;
++					fi->isFinished = false;
++					fi->isRunning = false;
++					//record the max stageID among flows
++					if(sid > current_max_){
++						current_max_ = sid;
++					}
++					if(fi->agent_ == NULL){
++						fi->agent_ = agent_;
++					}
++					isFound = true;
++					//printf("change flow no.%d\n", fid);
++					break;
++					}
++			}
++		
++			if(!isFound){
++				
++				flowinfo* temp_fi = (flowinfo *)malloc(sizeof(flowinfo));
++				temp_fi->fid_ = fid;
++				temp_fi->sid_ = sid;
++				temp_fi->size_ = size;
++				temp_fi->st_ = st;	
++				temp_fi->isFinished = false;
++				temp_fi->isRunning = false;
++				temp_fi->agent_ = agent_;
++			
++				//record the max stageID among flows
++				if(sid > current_max_){
++					current_max_ = sid;
++				}
++					
++				this->fis_->push_back(temp_fi);
++				//printf("add flow no.%d, stage_id:%d\n", fid, sid);
++			}
++
++			return (TCL_OK);	
++                }	
++	}
++
++	return (Application::command(argc, argv));
++}
++
++void Task::agentCallBack(int idx){
++
++	return this->flowFinished(idx);
++}
++
++/*
++* FUNCTION: flowFinished() details are as follows:
++*
++* update finished flow and check if a stage is all clear
++* yes: goes to next stage, start all flows in next stage
++* no: wait for next finished flow in the same stage and then check it again when a new flow finishes.
++*
++* @author Jesson LIU
++*/
++void Task::flowFinished(int index){
++	
++	int fln_size = (this->fis_)->size();
++
++	//set flow-finished flag
++	for(int i=0; i<fln_size; i++){
++
++		if(((this->fis_)->at(i))->fid_==index){
++
++			((this->fis_)->at(i))->isFinished = true;
++			if(this->printable_){
++				printf("# flow no.%d finished\n", index);
++				//printf("time is %lf\n", Scheduler::instance().clock());
++				int fid = ((this->fis_)->at(i))->fid_;
++				printf("%d %lf\n", fid, Scheduler::instance().clock());
++			}
++			break;
++		}
++	}
++
++	//if(this->printable_){
++	//	printf("current maximum stage is %d\n", current_max_);
++	//}
++
++	bool stageAllClear = true;
++	unsigned short finishedFlowNum = 0;
++	//check if all flows in current_max_ stage finished
++	for(int i=0; i<fln_size; i++){
++
++		if(((this->fis_)->at(i))->sid_>=current_max_){
++
++			if(!((this->fis_)->at(i))->isFinished){
++				//find one flow not finished in this/previous stage
++				//cannot start next stage
++				stageAllClear = false;
++				break;
++			}else{
++				//record finished flows
++				finishedFlowNum++;
++			}
++		}else{
++
++			current_max_ = ((this->fis_)->at(i))->sid_;
++			if(this->printable_){
++				printf("# stage %d is clear\n", current_max_+1);
++			}
++			break;
++		}
++	}
++
++	if(stageAllClear && (finishedFlowNum<fln_size)){
++		/*
++		 * start next stage
++		 */
++		for(int i=0; i<fln_size; i++){
++
++			Agent *temp_agt = (this->fis_)->at(i)->agent_;
++			long sd_size = (this->fis_)->at(i)->size_; 
++			int sid = (this->fis_)->at(i)->sid_;
++			
++			int fid = (this->fis_)->at(i)->fid_;			
++
++			if(sid == current_max_){
++				if(!(this->fis_)->at(i)->isRunning && this->ableToSend(this->fis_->at(i))){
++					//start current stage
++					if(this->printable_){
++						printf("# start flow no.%d, stage no.%d\n", fid, sid);
++					}
++					temp_agt->sendmsg(sd_size);
++					//to prevent this flow starts sending again
++					(this->fis_)->at(i)->isRunning = true;
++				}
++			}else if(sid < current_max_){
++				//stop, cause all flows in current stage is sending
++				break;
++			}else{
++				//pass previous stages
++				continue;
++			}
++		}
++	}
++}
++
++void Task::start()
++{
++	
++	std::sort(fis_->begin(), fis_->end(), SortFlow);
++	
++	int current_max = ((this->fis_)->at(0))->sid_;
++	int fln_size = (this->fis_)->size();
++	//printf("size of flows: %d\n", fln_size);
++	if(this->printable_){
++		printf("# current maximum stage is %d\n", current_max_);
++	}
++	
++	//start from the highest stage
++	for(int i=0; i<fln_size; i++){
++		
++		Agent *temp_agt = (this->fis_)->at(i)->agent_;
++		long sd_size = (this->fis_)->at(i)->size_; 
++		int sid = (this->fis_)->at(i)->sid_;
++		int fid = (this->fis_)->at(i)->fid_;
++		if(sid >= current_max){
++			if(!((this->fis_)->at(i))->isRunning && this->ableToSend(this->fis_->at(i))) {
++				(this->fis_)->at(i)->isRunning = true;
++				temp_agt->sendmsg(sd_size);
++				if(this->printable_){
++					printf("# start stage no.%d, flow no.%d, data size: %ld\n", sid, fid, sd_size);
++				}
++			}
++		}else{
++			break;
++		}
++	}
++}
++
++void Task::pre_send(){
++	
++	int fln_size = (this->fis_)->size();
++	/* 
++	 * PRE-SENDING
++	 *
++	 * each flow send one bytes, for connection establishments and statistics
++	 * could be DELETED or COMMENTED
++	 * but for throughput statistic consideration (to generate thrfile.tr/mytracefile.tr)
++	 * in dctcp-based tcl scripts, DELETED or COMMENTED are not recommanded (errors occure if deleted)
++	 *
++	 * @author Jesson LIU
++	 */
++	for(int i=0; i<fln_size; i++){
++	
++		Agent* temp_agt = (this->fis_)->at(i)->agent_;
++		temp_agt->sendmsg(1);		
++	}
++}
++
++void Task::stop()
++{
++}
++
++void Task::send(int nbytes)
++{
++	/* 
++	 * not used in this application
++	 * but we still provide the function
++	 * @author Jesson LIU
++	 **/
++	int agent_size = (this->agents_)->size();
++	for(int i=0; i<agent_size; i++){
++		Agent *temp_agent = (this->agents_)->at(i);
++		temp_agent->sendmsg(nbytes);
++	}
++}
++
++void Task::send_certain_flow(int fid){
++
++	int agent_size = (this->fis_)->size();
++	for(int i=0; i<agent_size; i++){
++
++		Agent * temp_agent = ((this->fis_)->at(i))->agent_;
++		int cur_fid = ((this->fis_)->at(i))->fid_;
++		long fl_size = ((this->fis_)->at(i))->size_;
++
++		if(cur_fid == fid){
++			if(!((this->fis_)->at(i))->isRunning && this->ableToSend(this->fis_->at(i))){
++				((this->fis_)->at(i))->isRunning = true;
++				
++				//if(this->printable_){
++				//	printf("starting flow no.%d\n", fid);
++				//}
++				temp_agent->sendmsg(fl_size);
++			}
++			break;
++		}
++	}
++}
++
++bool Task::ableToSend(flowinfo* fi){
++
++	double now = Scheduler::instance().clock();
++
++	if(fi->st_<0){
++
++		return true;
++	}else if(now>=fi->st_){
++
++		return true;
++	}else{
++
++		return false;
++	}
++}
++
++void Task::recv(int nbytes)
++{
++	/* not used in this application */
++	
++	/*if (! enableRecv_)
++		return;
++	Tcl& tcl = Tcl::instance();
++	tcl.evalf("%s recv %d", name_, nbytes);*/
++}
++
++
++void Task::resume()
++{
++	if (! enableResume_)
++		return;
++	Tcl& tcl = Tcl::instance();
++	tcl.evalf("%s resume", name_);
++}
+diff -ruN temp/ns-allinone-2.35/ns-2.35/apps/task.h ns-allinone-2.35/ns-2.35/apps/task.h
+--- temp/ns-allinone-2.35/ns-2.35/apps/task.h	1970-01-01 08:00:00.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/apps/task.h	2018-06-01 08:03:03.287835500 +0800
+@@ -0,0 +1,97 @@
++/* -*-	Mode:C++; c-basic-offset:8; tab-width:8; indent-tabs-mode:t -*- */
++/*
++ * Copyright (c) 1997 Regents of the University of California.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. All advertising materials mentioning features or use of this software
++ *    must display the following acknowledgement:
++ *	This product includes software developed by the Daedalus Research
++ *	Group at the University of California Berkeley.
++ * 4. Neither the name of the University nor of the Laboratory may be used
++ *    to endorse or promote products derived from this software without
++ *    specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * Contributed by the Daedalus Research Group, http://daedalus.cs.berkeley.edu
++ *
++ */
++
++/*
++* An application for multi-stage tatcp and/or other multi-ware-like application
++*
++* @author Jesson LIU
++*/
++
++#ifndef ns_task_h
++#define ns_task_h
++
++#include <vector>
++#include <algorithm>
++#include "config.h"
++#include "packet.h"
++#include "agent.h"
++#include "app.h"
++#include "ns-process.h"
++
++class Agent;
++
++struct flowinfo{
++
++	int fid_;
++	int sid_;
++	long size_;
++	double st_;
++	bool isFinished;
++	bool isRunning;
++	Agent* agent_;
++};
++
++class Task : public Application {
++public:
++	Task();
++	virtual void send(int nbytes);
++	virtual void recv(int nbytes);
++	virtual void resume();
++	virtual void agentCallBack(int idx);
++
++protected:
++	virtual int command(int argc, const char*const* argv);
++	virtual void start();
++	virtual void stop();
++	virtual void pre_send();
++	virtual void send_certain_flow(int fid);
++
++	//virtual void attach_agent(Agent* agt, int fid, int sid, long fs);
++	//virtual void attach_agent(Agent* agt, int fid, int sid, long fs, double st);
++	virtual void flowFinished(int index);	//index is fid_ in agent
++	virtual bool ableToSend(flowinfo* fi);	//check if the flow is able to send
++
++	// for all agents in the task (here treat agents as tcp connections)
++	vector<Agent*>* agents_;
++	vector<flowinfo*>* fis_;
++	bool printable_;
++
++	// the maximum stage of current
++	int current_max_;
++};
++
++#endif
+diff -ruN temp/ns-allinone-2.35/ns-2.35/common/agent.cc ns-allinone-2.35/ns-2.35/common/agent.cc
+--- temp/ns-allinone-2.35/ns-2.35/common/agent.cc	2010-03-08 13:54:49.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/common/agent.cc	2018-06-01 08:03:22.019943834 +0800
+@@ -200,6 +200,20 @@
+ 	return (Connector::command(argc, argv));
+ }
+ 
++/*
++ * calling application
++ * @author Jesson LIU
++ * */
++
++int Agent::callApplication(int idx){
++
++	if(this->app_ != NULL){
++	
++		(this->app_)->agentCallBack(idx);
++	}
++	return 0;
++}
++
+ void Agent::flushAVar(TracedVar *v)
+ {
+ 	char wrk[256], value[128];
+diff -ruN temp/ns-allinone-2.35/ns-2.35/common/agent.h ns-allinone-2.35/ns-2.35/common/agent.h
+--- temp/ns-allinone-2.35/ns-2.35/common/agent.h	2011-08-27 03:26:39.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/common/agent.h	2018-06-01 08:03:22.019943834 +0800
+@@ -107,6 +107,12 @@
+ 	void set_pkttype(packet_t pkttype) { type_ = pkttype; }
+ 	inline packet_t get_pkttype() { return type_; }
+ 
++	/**
++	 * calling application
++	 * @author Jesson LIU
++	 **/
++	virtual int callApplication(int);
++
+  protected:
+ 	int command(int argc, const char*const* argv);
+ 	virtual void delay_bind_init_all();
+diff -ruN temp/ns-allinone-2.35/ns-2.35/Makefile.in ns-allinone-2.35/ns-2.35/Makefile.in
+--- temp/ns-allinone-2.35/ns-2.35/Makefile.in	2011-10-24 00:29:54.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/Makefile.in	2018-06-01 08:04:07.556206674 +0800
+@@ -177,7 +177,7 @@
+ 	classifier/classifier-port.o src_rtg/classifier-sr.o \
+         src_rtg/sragent.o src_rtg/hdr_src.o adc/ump.o \
+ 	qs/qsagent.o qs/hdr_qs.o \
+-	apps/app.o apps/telnet.o tcp/tcplib-telnet.o \
++	apps/app.o apps/telnet.o tcp/tcplib-telnet.o apps/task.o \
+ 	tools/trafgen.o trace/traffictrace.o tools/pareto.o \
+ 	tools/expoo.o tools/cbr_traffic.o \
+ 	adc/tbf.o adc/resv.o adc/sa.o tcp/saack.o \
+diff -ruN temp/ns-allinone-2.35/ns-2.35/tcl/lib/ns-default.tcl ns-allinone-2.35/ns-2.35/tcl/lib/ns-default.tcl
+--- temp/ns-allinone-2.35/ns-2.35/tcl/lib/ns-default.tcl	2010-07-04 06:45:45.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/tcl/lib/ns-default.tcl	2018-06-05 08:57:02.573600677 +0800
+@@ -900,6 +900,13 @@
+ Agent/SCTP/CMT set countPFToActiveRtxms_ 0;   # count of PF->Active changes
+                                               # for retransmissions
+ 
++# Jesson LIU
++Agent/TCP set task_id_ 0;		# 0 means no task id;
++Agent/TCP set stage_id_ 1;		# 0 means no stage id; but 1 by default
++Agent/TCP set flowsize_ -1;		# -1 means no completion time printing
++Agent/TCP set rate_interval_ 0.01;	# 10ms by default as Aalo addressed in its paper;
++Agent/TCP set aalo_rate_ 84;		# 84 packet/rtt by default, 1Gbps at rtt=0.001
++
+ Agent/TCP set seqno_ 0
+ Agent/TCP set t_seqno_ 0
+ Agent/TCP set maxburst_ 0
+diff -ruN temp/ns-allinone-2.35/ns-2.35/tcp/tcp.cc ns-allinone-2.35/ns-2.35/tcp/tcp.cc
+--- temp/ns-allinone-2.35/ns-2.35/tcp/tcp.cc	2011-06-20 12:51:46.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/tcp/tcp.cc	2018-06-05 08:54:57.104393606 +0800
+@@ -47,6 +47,7 @@
+ #include "basetrace.h"
+ #include "hdr_qs.h"
+ 
++
+ int hdr_tcp::offset_;
+ 
+ static class TCPHeaderClass : public PacketHeaderClass {
+@@ -76,7 +77,8 @@
+ 	  first_decrease_(1), fcnt_(0), nrexmit_(0), restart_bugfix_(1), 
+           cong_action_(0), ecn_burst_(0), ecn_backoff_(0), ect_(0), 
+           use_rtt_(0), qs_requested_(0), qs_approved_(0),
+-	  qs_window_(0), qs_cwnd_(0), frto_(0)
++	  qs_window_(0), qs_cwnd_(0), frto_(0),
++	  rate_timer_(this), isRateTimerStarted_(0), printful_(1)	// Jesson
+ {
+ #ifdef TCP_DELAY_BIND_ALL
+         // defined since Dec 1999.
+@@ -101,6 +103,13 @@
+         bind("necnresponses_", &necnresponses_);
+         bind("ncwndcuts_", &ncwndcuts_);
+ 	bind("ncwndcuts1_", &ncwndcuts1_);
++
++	// Jesson Liu
++	bind("task_id_", &task_id_);
++	bind("stage_id_", &stage_id_);
++	bind("rate_interval_", &rate_interval_);
++	bind("aalo_rate_", &aalo_rate_);
++	bind("flowsize_", &flowsize_);
+ #endif /* TCP_DELAY_BIND_ALL */
+ 
+ }
+@@ -161,6 +170,13 @@
+         delay_bind_init_one("trace_all_oneline_");
+         delay_bind_init_one("nam_tracevar_");
+ 
++	// Jesson LIU
++	delay_bind_init_one("task_id_");
++	delay_bind_init_one("stage_id_");
++	delay_bind_init_one("rate_interval_");
++	delay_bind_init_one("aalo_rate_");
++	delay_bind_init_one("flowsize_");
++
+         delay_bind_init_one("QOption_");
+         delay_bind_init_one("EnblRTTCtr_");
+         delay_bind_init_one("control_increase_");
+@@ -212,6 +228,7 @@
+         delay_bind_init_one("necnresponses_");
+         delay_bind_init_one("ncwndcuts_");
+ 	delay_bind_init_one("ncwndcuts1_");
++
+ #endif /* TCP_DELAY_BIND_ALL */
+ 
+ 	Agent::delay_bind_init_all();
+@@ -270,6 +287,12 @@
+ 	if (delay_bind(varName, localName, "k_parameter_", &k_parameter_, tracer)) return TCL_OK;
+         if (delay_bind(varName, localName, "l_parameter_", &l_parameter_, tracer)) return TCL_OK;
+ 
++	// Jesson LIU
++	if (delay_bind(varName, localName, "task_id_", &task_id_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "stage_id_", &stage_id_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "rate_interval_", &rate_interval_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "aalo_rate_", &aalo_rate_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "flowsize_", &flowsize_, tracer)) return TCL_OK;
+ 
+         if (delay_bind_bool(varName, localName, "trace_all_oneline_", &trace_all_oneline_ , tracer)) return TCL_OK;
+         if (delay_bind_bool(varName, localName, "nam_tracevar_", &nam_tracevar_ , tracer)) return TCL_OK;
+@@ -893,16 +916,28 @@
+ 	 * The F-RTO code is from Pasi Sarolahti.  F-RTO is an algorithm
+ 	 * for detecting spurious retransmission timeouts.
+          */
+-        if (frto_ == 2) {
++        /*if (frto_ == 2) {
+                 return (force_wnd(2) < wnd_ ?
+                         force_wnd(2) : (int)wnd_);
+         } else {
+ 		return (cwnd_ < wnd_ ? (int)cwnd_ : (int)wnd_);
+-        }
++        }*/
++
++	if (frto_ == 2) {
++		return (force_wnd(2) < aalo_rate_ ?
++			force_wnd(2) : (int)aalo_rate_);
++	} else {
++		return (cwnd_ < aalo_rate_ ? (int)cwnd_ : (int)aalo_rate_);
++	}
++	
++	// Jesson, changing cwnd_ or wnd_ into aalo_rate_
++
++	//return aalo_rate_;
++
+ }
+ 
+ double TcpAgent::windowd()
+-{
++{	
+ 	return (cwnd_ < wnd_ ? (double)cwnd_ : (double)wnd_);
+ }
+ 
+@@ -913,9 +948,24 @@
+ void TcpAgent::send_much(int force, int reason, int maxburst)
+ {
+ 	send_idle_helper();
+-	int win = window();
++//	int win = window();
++	int win = (cwnd_ < aalo_rate_ ? (int)cwnd_ : (int)aalo_rate_);		// Jesson
+ 	int npackets = 0;
+ 
++//	printf("#%d, cwnd_:%d	win:%d\n", fid_, (int)cwnd_, win);
++
++	// Jesson LIU
++	if(!(rate_timer_.status() == TIMER_PENDING) && !(isRateTimerStarted_)){
++
++		out_task_id_ = task_id_;
++		out_stage_id_ = stage_id_;
++		out_fid_ = fid_;
++		rate_timer_.resched(rate_interval_);
++		isRateTimerStarted_ = 1;
++	}
++
++	//printf("win: %d\n", win);
++	
+ 	if (!force && delsnd_timer_.status() == TIMER_PENDING)
+ 		return;
+ 	/* Save time when first packet was sent, for newreno  --Allman */
+@@ -948,7 +998,8 @@
+ 			delsnd_timer_.resched(Random::uniform(overhead_));
+ 			return;
+ 		}
+-		win = window();
++//		win = window();
++		win = (cwnd_ < aalo_rate_ ? (int)cwnd_ : (int)aalo_rate_);	// Jesson
+ 		if (maxburst && npackets == maxburst)
+ 			break;
+ 	}
+@@ -1977,6 +2028,202 @@
+ 	a_->timeout(TCP_TIMER_BURSTSND);
+ }
+ 
++
++//--------------Aalo function------------------
++//TracedDouble getUpdateCoflowRate(int cid, int sid, int fid);
++//struct CoflowInfo* createCoflow(int, int, int);
++//struct CoflowInfo* getCofolow(int, int, int);
++
++
++struct CoflowInfo *coflows_ = NULL;
++struct CoflowInfo *coflows_end_ = NULL;
++int num_coflows_ = 0;
++/* Jesson, for Aalo to get the rate from coordinator
++ * each TCP connection will require from and report to coordinator every 'rate_interval_' period (10ms by default)
++ * the following functions should finished in this method: 
++ *	1. send data sent to fresh coordinator's corresponding data (e.g., data_sent in CoflowInfo structure)
++ *	2. get freshed 'data_sent' & 'num_flows' back and calculate the proper transmission rate
++ * 	3. update the transmission rate to 'aalo_rate_' parameter
++ */
++
++void RateTimer::expire(Event*)
++{
++	short isFound = 0;
++	struct CoflowInfo* tpc = a_->getCoflow(a_->out_task_id_, a_->out_stage_id_, a_->out_fid_);
++	if(tpc != NULL){
++
++		FlowInfo *tpf = tpc->flows;
++		while(tpf!=NULL){
++			if(tpf->fid == a_->out_fid_){
++				// Find the target
++				tpf->data_sent = a_->get_highest_ack_();
++				isFound = 1;
++				break;
++			}
++			tpf = tpf->next;
++		}
++
++		if(!isFound){
++			// a new flow in coflow, add it!
++			struct FlowInfo* fi = new struct FlowInfo;
++			fi->fid = a_->out_fid_;
++			fi->stage_id = a_->out_stage_id_;
++			fi->data_sent = a_->get_highest_ack_();
++			fi->next = NULL;
++			tpc->flows_end->next = fi;
++			tpc->flows_end = fi;
++		}
++
++		a_->aalo_rate_ = a_->getUpdatedCoflowRate(a_->out_task_id_, a_->out_stage_id_, a_->out_fid_);
++		
++	}else{
++		printf("ERROR, No such coflow\n");
++	}
++
++	this->resched(a_->rate_interval_);
++}
++
++TracedDouble TcpAgent::getUpdatedCoflowRate(int cid, int sid, int fid){
++
++	TracedDouble rate = 2.0;
++	int csize = num_coflows_;
++	float target_weight = 0;
++//	int target_num_flows = 0;
++
++	float weights[csize];
++	int counter = 0;
++	int K=10;
++	int E=10;
++	long BASE=1024*1024*10;		// 10MB	
++
++	//vector<CoflowInfo*>::iterator cit;
++	CoflowInfo *tc = coflows_;
++	//for(cit=coflows_->begin(); cit!=coflows_->end(); cit++){
++	while(tc!=NULL){
++		// Compute the weight for each coflow
++		long data_lens = 0;
++		FlowInfo *tf = tc->flows;
++		//vector<FlowInfo*>::iterator fit;
++		
++		//for(fit=tf->begin(); fit!=tf->end(); fit++){
++		while(tf!=NULL){
++	
++			data_lens += tf->data_sent;
++			tf = tf->next;
++		}
++
++		double ti = data_lens/BASE;
++		int i=1;
++		while(ti>1&&ti<=K){
++			
++			ti/=E;
++			i++;
++		}
++
++		weights[counter] = K-i+1;
++		if(tc->coflow_id == cid){
++			
++			target_weight = weights[counter];
++//			target_num_flows = tc->num_flows;
++		}	
++
++		counter++;	// next coflow
++		tc = tc->next;
++	}
++	
++	// TODO, compute the rate	
++	
++	float total_weight = 0;
++	for(int j=0; j<csize; j++){
++		
++		total_weight += weights[j];
++	}
++
++//	float final_tweight = target_weight-sid+1;		//sid starts from 1, sorted by flow starting time
++	float final_tweight = target_weight-2+sid;
++	final_tweight = final_tweight>1 ? final_tweight : 1;
++
++	rate = MAX_CWND*FRACTION*final_tweight/total_weight;
++	//rate = rate>2.0 ? rate : (TracedDouble)2.0;
++	double temp_rate = (double)rate > 2.0 ? (double)rate : 2.0;
++	rate = (TracedDouble) temp_rate;
++
++	//printf("current rate for %d-%d is: %lf\n", cid, fid, (double)rate);
++
++	return rate;
++}
++
++struct CoflowInfo* TcpAgent::getCoflow(int cid, int sid, int fid){
++
++	struct CoflowInfo* temp = coflows_;
++
++//	vector<CoflowInfo*>::iterator it;
++//	for(it=coflows_->begin();it!=coflows_->end();it++){
++	while(temp!=NULL){
++
++		if(temp->coflow_id == cid){
++			return temp;
++		}
++		temp = temp->next;
++	}
++
++	// not found, a new coflow information
++	temp = createCoflow(cid, sid, fid);
++	
++	return temp;
++}
++
++struct CoflowInfo* TcpAgent::createCoflow(int cid, int sid, int fid){
++	
++	struct CoflowInfo *tc = new struct CoflowInfo;
++	tc->coflow_id = cid;
++	struct FlowInfo *fi = new struct FlowInfo;
++	fi->fid = fid;
++	fi->stage_id = sid;
++	fi->data_sent = 0;
++	fi->next = NULL;
++	
++	if(coflows_==NULL){
++		tc->next = NULL;
++		tc->previous = NULL;
++		coflows_ = tc;
++		coflows_end_ = tc;
++//		printf("first coflow established\n");
++	}else{
++		coflows_end_->next = tc;
++		tc->previous = coflows_end_;
++		tc->next = NULL;
++		coflows_end_ = tc;
++//		printf("a new coflow attached\n");
++	}
++	
++	tc->flows = fi;
++	tc->flows_end = fi;
++
++	num_coflows_++;
++	printf("# currently %d coflows\n", num_coflows_);
++	return tc;
++}
++
++void TcpAgent::deleteCofolow(int cid){
++
++	struct CoflowInfo* tc = coflows_;
++
++	while(tc!=NULL){
++
++		if(tc->coflow_id == cid){
++			
++			break;
++		}
++		tc = tc->next;
++	}
++	tc->next->previous = tc->previous;
++	tc->previous->next = tc->next;
++
++	delete tc;
++}
++
++
+ /*
+  * THE FOLLOWING FUNCTIONS ARE OBSOLETE, but REMAIN HERE
+  * DUE TO OTHER PEOPLE's TCPs THAT MIGHT USE THEM
+diff -ruN temp/ns-allinone-2.35/ns-2.35/tcp/tcp.h ns-allinone-2.35/ns-2.35/tcp/tcp.h
+--- temp/ns-allinone-2.35/ns-2.35/tcp/tcp.h	2011-08-27 03:29:57.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/tcp/tcp.h	2018-06-05 08:33:18.549804142 +0800
+@@ -124,6 +124,33 @@
+ #define TCP_TIMER_Q         4
+ #define TCP_TIMER_RESET        5 
+ 
++// Jesson LIU, Aalo
++#define MAX_CWND 44		/* the maximum cwnd_ that a sender can get*/
++#define FRACTION 1.0
++
++struct FlowInfo{
++
++	u_int16_t fid;
++	u_int8_t stage_id;
++	u_int32_t data_sent;
++	struct FlowInfo *next;
++};
++
++struct CoflowInfo{
++
++	u_int16_t coflow_id;
++	//u_int16_t num_flows;
++	struct FlowInfo *flows;
++	struct FlowInfo *flows_end;
++	struct CoflowInfo *previous;
++	struct CoflowInfo *next;
++};
++// Header of all coflow information
++//extern vector<CoflowInfo*>* coflows_;
++extern struct CoflowInfo *coflows_;
++extern struct CoflowInfo *coflows_end_;
++extern int num_coflows_;
++
+ class TcpAgent;
+ 
+ class RtxTimer : public TimerHandler {
+@@ -151,6 +178,20 @@
+ };
+ 
+ /*
++ * @author Jesson LIU
++ * periodically fetch rate from coordinator (approximately 10ms/time)
++ */
++class RateTimer : public TimerHandler {
++
++public:
++	RateTimer(TcpAgent *a) : TimerHandler() { a_ = a; }
++protected:
++	virtual void expire(Event *e);
++	TcpAgent *a_;
++};
++
++
++/*
+  * Variables for HighSpeed TCP.
+  */
+ //int *hs_win_;		// array of cwnd values
+@@ -190,6 +231,20 @@
+ 	/* These two functions aid Tmix one-way TCP agents */
+ 	int is_closed() {return closed_;} 
+ 	void clr_closed() {closed_ = 0;}
++
++	// Jesson
++	int out_task_id_;
++	int out_stage_id_;	
++	int out_fid_;
++	TracedDouble aalo_rate_;
++	double rate_interval_;
++	int get_highest_ack_(){ return (int)highest_ack_;}
++
++	TracedDouble getUpdatedCoflowRate(int cid, int sid, int fid);
++	struct CoflowInfo* createCoflow(int, int, int);
++	struct CoflowInfo* getCoflow(int, int, int);
++	void deleteCofolow(int);
++
+ protected:
+ 	virtual int window();
+ 	virtual double windowd();
+@@ -324,6 +379,9 @@
+ 	RtxTimer rtx_timer_;
+ 	DelSndTimer delsnd_timer_;
+ 	BurstSndTimer burstsnd_timer_;
++	//Jesson
++	RateTimer rate_timer_;
++
+ 	virtual void cancel_timers() {
+ 		rtx_timer_.force_cancel();
+ 		burstsnd_timer_.force_cancel();
+@@ -430,6 +488,16 @@
+ 	int useHeaders_;	/* boolean: Add TCP/IP header sizes */
+ 	/* end of specifying variants */
+ 
++	/*
++	 * Aalo, @author Jesson LIU
++	 */
++	int task_id_;
++	int stage_id_;
++	int flowsize_;
++	short printful_;
++	/* data sent equals to highest_ack_ */
++	short isRateTimerStarted_;
++
+ 	/* Used for ECN */
+ 	int ecn_;		/* Explicit Congestion Notification */
+ 	int cong_action_;	/* Congestion Action.  True to indicate
+diff -ruN temp/ns-allinone-2.35/ns-2.35/tcp/tcp-newreno.cc ns-allinone-2.35/ns-2.35/tcp/tcp-newreno.cc
+--- temp/ns-allinone-2.35/ns-2.35/tcp/tcp-newreno.cc	2009-12-31 06:06:34.000000000 +0800
++++ ns-allinone-2.35/ns-2.35/tcp/tcp-newreno.cc	2018-06-05 05:41:26.509123345 +0800
+@@ -210,6 +210,18 @@
+ 		exit(1);
+ 	}
+ #endif
++
++	/* Jesson, to print the completion time of flows. But flow size need to be greater than 0,
++	 * which means no completion time printing by default.
++	 */
++	if(((int)highest_ack_+1)>=(flowsize_/1460) && flowsize_>0 && printful_){
++		
++		double ft = Scheduler::instance().clock();
++		printf("%d %lf\n", fid_, ft);
++		this->callApplication(fid_);
++		printful_ = 0;
++        }
++
+         /* W.N.: check if this is from a previous incarnation */
+         if (tcph->ts() < lastreset_) {
+                 // Remove packet and do nothing
